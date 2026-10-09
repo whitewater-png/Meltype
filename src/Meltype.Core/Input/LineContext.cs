@@ -16,6 +16,8 @@ public enum LineKind
     String,
     /// <summary>ターミナルで動く AI・チャットの入力 (Claude Code・Codex などの「&gt; 」の後)。日本語を書くことが多い。</summary>
     Prompt,
+    /// <summary>ターミナルのコマンドの、文を書く引数 (echo の後、git commit -m の後など。引用符の無いもの)。日本語を判定する。</summary>
+    Argument,
 }
 
 /// <summary>「コード」のアプリで、フォーカスのある入力欄の種類。</summary>
@@ -175,6 +177,140 @@ public static class LineContext
         return i + 1 == line.Length || line[i + 1] == ' ' || line[i + 1] == '\u00A0';
     }
 
+    /// <summary>
+    /// ターミナルの今の行 (キャレットより前) で、キャレットの位置が日本語を書く場所かを調べる (#71)。
+    /// コマンド名・オプション・パス・リダイレクト先・打ちかけの語は <see cref="LineKind.Code"/> (英字のまま通す)。
+    /// 引用符の中は String、# の後は Comment、AI の入力行は Prompt、echo などの文・-m / --message の後は Argument。
+    /// hasPrompt: 画面から読んだ行で、先頭にプロンプト (PS C:\&gt;・$・❯ など) が付いているか (打鍵だけから追いかけた行には付かない)。
+    /// </summary>
+    public static LineKind ClassifyShell(string text, bool hasPrompt)
+    {
+        var lastNewline = text.LastIndexOfAny(['\r', '\n']);
+        var line = lastNewline >= 0 ? text[(lastNewline + 1)..] : text;
+        if (IsChatPrompt(line)) return LineKind.Prompt;
+        if (hasPrompt) line = StripShellPrompt(line);
+
+        var words = new List<string>(); // 今のコマンド (| ; & の区切りの後) の、打ち終えた語
+        var word = new StringBuilder();
+        var inWord = false;
+        var redirect = false; // > < の後 (次の語はファイル名)
+        char? quote = null;
+        for (var i = 0; i < line.Length; i++)
+        {
+            var c = line[i];
+            if (quote is { } q)
+            {
+                // "…" の中のエスケープ (bash の \"、PowerShell の `")
+                if (q == '"' && c is '\\' or '`' && i + 1 < line.Length && line[i + 1] == '"') i++;
+                else if (c == q) quote = null;
+                else word.Append(c);
+                continue;
+            }
+            if (c is '"' or '\'')
+            {
+                quote = c;
+                inWord = true;
+                continue;
+            }
+            if (char.IsWhiteSpace(c))
+            {
+                EndWord();
+                continue;
+            }
+            // # コメント (bash・PowerShell。語の途中の # は除く)
+            if (c == '#' && !inWord) return LineKind.Comment;
+            if (c is '|' or ';' or '&' or '(' or ')' or '{' or '}')
+            {
+                EndWord();
+                words.Clear();
+                redirect = false;
+                continue;
+            }
+            if (c is '>' or '<')
+            {
+                // 2>&1 の 2 は語ではない。echo hi>out の hi は語。
+                if (inWord && word.ToString() is "1" or "2")
+                {
+                    word.Clear();
+                    inWord = false;
+                }
+                EndWord();
+                redirect = true;
+                // >> と >&1 の続きの記号も、リダイレクトの一部
+                while (i + 1 < line.Length && line[i + 1] is '>' or '&') i++;
+                if (i > 0 && line[i] == '&' && i + 1 < line.Length && char.IsAsciiDigit(line[i + 1]))
+                {
+                    i++;
+                    redirect = false;
+                }
+                continue;
+            }
+            word.Append(c);
+            inWord = true;
+        }
+        if (quote is not null) return LineKind.String;
+        // 確定した日本語のすぐ後ろは、続けて文を書いている (echo 今日は|)。
+        if (inWord && word.ToString().Any(ch => ch > '\u007F')) EndWord();
+        // 打ちかけの語 (そのまま通した src/fo など) の続きは、そのまま通す。
+        if (inWord || redirect || words.Count == 0) return LineKind.Code;
+        var command = CommandName(words[0]);
+        if (TextCommands.Contains(command)) return LineKind.Argument;
+        // -m は git などのコミットの文だけ (python -m のモジュール名は英字のまま)。
+        for (var w = 1; w < words.Count; w++)
+        {
+            if (MessageOptions.Contains(words[w]) || (words[w] == "-m" && CommitCommands.Contains(command))) return LineKind.Argument;
+        }
+        return LineKind.Code;
+
+        void EndWord()
+        {
+            if (!inWord) return;
+            if (redirect) redirect = false; // リダイレクト先のファイル名は、コマンドの語に数えない
+            else words.Add(word.ToString());
+            word.Clear();
+            inWord = false;
+        }
+    }
+
+    /// <summary>画面から読んだ行の先頭のプロンプトを除く。見つからなければそのまま。</summary>
+    private static string StripShellPrompt(string line)
+    {
+        // PowerShell: PS C:\Users\me>
+        if (line.StartsWith("PS ", StringComparison.Ordinal) && line.IndexOf('>') is var ps and > 0) return line[(ps + 1)..];
+        // コマンドプロンプト: C:\Users\me>
+        if (line.Length >= 3 && char.IsAsciiLetter(line[0]) && line[1] == ':' && line[2] == '\\' && line.IndexOf('>') is var cmd and > 0) return line[(cmd + 1)..];
+        // bash・zsh・fish・starship など: いちばん前の「$ 」「❯ 」「% 」「# 」「➜ 」「λ 」「» 」「> 」まで
+        var end = -1;
+        foreach (var marker in (ReadOnlySpan<string>)["$ ", "❯ ", "% ", "# ", "➜ ", "λ ", "» ", "> "])
+        {
+            var index = line.IndexOf(marker, StringComparison.Ordinal);
+            if (index >= 0 && (end < 0 || index < end)) end = index + marker.Length - 1;
+        }
+        return end >= 0 ? line[end..] : line;
+    }
+
+    /// <summary>コマンド名 (パスと .exe を除き、小文字)。</summary>
+    private static string CommandName(string word)
+    {
+        var name = word[(word.LastIndexOfAny(['/', '\\']) + 1)..].ToLowerInvariant();
+        return name.EndsWith(".exe", StringComparison.Ordinal) ? name[..^4] : name;
+    }
+
+    /// <summary>引数に文を書くコマンド (引用符が無くても、引数で日本語を判定する)。</summary>
+    private static readonly HashSet<string> TextCommands = new(StringComparer.Ordinal)
+    {
+        "echo", "printf", "write-host", "write-output", "claude", "codex", "gemini",
+    };
+
+    /// <summary>この後に文を書くオプション (git commit -m・gh issue create --title など)。</summary>
+    private static readonly HashSet<string> MessageOptions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "--message", "--title", "--body", "--notes", "--subject", "--prompt", "-Message",
+    };
+
+    /// <summary>-m の後に文 (コミットメッセージ) を書くコマンド。</summary>
+    private static readonly HashSet<string> CommitCommands = new(StringComparer.Ordinal) { "git", "hg", "svn", "jj" };
+
     private static readonly string[] ChatWords =
         ["chat", "チャット", "copilot", "claude", "codex", "gemini", "prompt", "プロンプト", "message", "メッセージ", "ask ", "質問", "composer", "agent", "エージェント", "cascade", "assistant", "アシスタント"];
 
@@ -249,6 +385,15 @@ public sealed class LineTracker
     private readonly object _gate = new();
     private readonly StringBuilder _text = new();
     private bool _known;
+    // 分からない間 (画面を読み終わるまで) にアプリへ届いた文字。読んだ文字列にまだ出ていなければ足す (#71: 1 文字目の取りこぼし)。
+    private readonly StringBuilder _unread = new();
+    private bool _fromScreen;
+
+    /// <summary>今の行を画面から読んだか (読んだ行にはターミナルのプロンプトが付いている)。打鍵だけで追いかけた行なら false。</summary>
+    public bool FromScreen
+    {
+        get { lock (_gate) return _known && _fromScreen; }
+    }
 
     /// <summary>キャレットより前の文字列 (前の行も含む)。分からなければ null。</summary>
     public string? Text
@@ -260,7 +405,11 @@ public sealed class LineTracker
     {
         lock (_gate)
         {
-            if (!_known) return;
+            if (!_known)
+            {
+                if (_unread.Length + text.Length <= MaxLength) _unread.Append(text);
+                return;
+            }
             foreach (var c in text) _text.Append(c == '\r' ? '\n' : c);
             Trim();
         }
@@ -270,7 +419,11 @@ public sealed class LineTracker
     {
         lock (_gate)
         {
-            if (!_known) return;
+            if (!_known)
+            {
+                if (_unread.Length > 0) _unread.Length--;
+                return;
+            }
             // 改行を消したら前の行とつながる (前の行も持っているので分かる)。
             if (_text.Length > 0) _text.Length--;
             else _known = false;
@@ -286,6 +439,8 @@ public sealed class LineTracker
             if (!_known) _text.Clear();
             else _text.Append('\n');
             _known = true;
+            _fromScreen = false;
+            _unread.Clear();
             Trim();
         }
     }
@@ -296,6 +451,7 @@ public sealed class LineTracker
         lock (_gate)
         {
             _text.Clear();
+            _unread.Clear();
             _known = false;
         }
     }
@@ -310,8 +466,15 @@ public sealed class LineTracker
     {
         lock (_gate)
         {
+            var text = before.Replace("\r\n", "\n").Replace('\r', '\n');
             _text.Clear();
-            _text.Append(before.Replace("\r\n", "\n").Replace('\r', '\n'));
+            _text.Append(text);
+            // 読む前に打った文字が、読んだ時にはまだ画面に出ていなかったら足す。
+            var unread = _unread.ToString();
+            if (unread.Length > 0 && !text.EndsWith(unread, StringComparison.Ordinal)) _text.Append(unread.Replace('\r', '\n'));
+            _unread.Clear();
+            // 今の行に何か書いてあれば (プロンプト)、画面から読んだ行。空なら打鍵だけで追いかけるのと同じ。
+            _fromScreen = text.Length > 0 && text[^1] != '\n';
             _known = true;
             Trim();
         }

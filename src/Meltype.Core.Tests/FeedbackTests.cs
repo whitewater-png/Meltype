@@ -358,6 +358,89 @@ internal static class CodeProfileTests
         Assert.Equal(LineKind.String, LineContext.ClassifyText(line.Text!), "UI Automation で読んだ文字列の、今の行で調べる");
     }
 
+    /// <summary>ターミナルの行 (画面から読んだもの。プロンプトから始まる) で、キャレットの位置が日本語を書く所か (#71)。</summary>
+    private static readonly (string Line, LineKind Expected)[] ShellLines =
+    [
+        // コマンド名・オプション・パス・リダイレクト先は英字のまま
+        (@"PS C:\Users\me> ", LineKind.Code),
+        (@"PS C:\Users\me> cd ", LineKind.Code),
+        (@"PS C:\Users\me> git ", LineKind.Code),
+        (@"PS C:\Users\me> git commit ", LineKind.Code),
+        (@"PS C:\Users\me> ls -la src/fo", LineKind.Code),
+        (@"PS C:\Users\me> npm install ", LineKind.Code),
+        (@"PS C:\Users\me> python -m ", LineKind.Code),
+        (@"PS C:\Users\me> echo hi > ", LineKind.Code),
+        (@"PS C:\Users\me> echo hi | ", LineKind.Code),
+        (@"C:\Users\me>dir ", LineKind.Code),
+        ("me@pc:~/src$ make ", LineKind.Code),
+        ("~/src ❯ cargo build ", LineKind.Code),
+        // 文を書く所は日本語を判定する
+        (@"PS C:\Users\me> echo ", LineKind.Argument),
+        (@"PS C:\Users\me> Write-Host ", LineKind.Argument),
+        (@"PS C:\Users\me> echo 今日は", LineKind.Argument),
+        (@"PS C:\Users\me> git commit -m ", LineKind.Argument),
+        (@"PS C:\Users\me> git commit -m 修正 ", LineKind.Argument),
+        ("me@pc:~$ gh issue create --title ", LineKind.Argument),
+        ("me@pc:~$ echo hi 2>&1 ", LineKind.Argument),
+        (@"PS C:\Users\me> git commit -m """, LineKind.String),
+        (@"PS C:\Users\me> git commit -m ""fix: ", LineKind.String),
+        (@"PS C:\Users\me> git commit -m ""done"" ", LineKind.Argument),
+        ("me@pc:~$ ls # ", LineKind.Comment),
+        ("│ > ", LineKind.Prompt),
+        // リダイレクト先 (out.txt) を打ち終えたら、echo の文の続き
+        (@"PS C:\Users\me> echo hi > out.txt ", LineKind.Argument),
+    ];
+
+    [Test]
+    public static void LineContext_ShellLines()
+    {
+        foreach (var (line, expected) in ShellLines)
+            Assert.Equal(expected, LineContext.ClassifyShell(line, hasPrompt: true), $"「{line}」");
+        // 前の行 (出力) は見ない
+        Assert.Equal(LineKind.Code, LineContext.ClassifyShell("echo hello\nhello\nPS C:\\> ", hasPrompt: true));
+    }
+
+    [Test]
+    public static void LineTracker_KeepsKeysTypedBeforeScreenRead()
+    {
+        // #71: Enter の後、画面を読み終わる前に打った「echo 」を取りこぼさない。
+        var line = new LineTracker();
+        line.Invalidate();
+        line.Append("echo ");
+        Assert.True(line.Text is null, "読み終わるまでは分からない");
+        line.SetFromText(@"PS C:\Users\me> ");
+        Assert.Equal(@"PS C:\Users\me> echo ", line.Text, "画面にまだ出ていない文字は足す");
+        Assert.True(line.FromScreen, "プロンプトから読んだ行");
+        Assert.Equal(LineKind.Argument, LineContext.ClassifyShell(line.Text!, line.FromScreen));
+
+        // 画面に出てから読んだなら、二重に足さない
+        line.Invalidate();
+        line.Append("echo ");
+        line.SetFromText(@"PS C:\Users\me> echo ");
+        Assert.Equal(@"PS C:\Users\me> echo ", line.Text);
+
+        // 打鍵だけで追いかけた行 (プロンプトが無い) は FromScreen ではない
+        line.NewLine();
+        Assert.True(!line.FromScreen, "打鍵だけで追いかけた行");
+    }
+
+    [Test]
+    public static void Settings_TerminalJapaneseDefaultsToSmart()
+    {
+        // #71: ターミナルで日本語を打てるのが既定。前の版の config.json (項目が無い) を読んでも同じ。
+        Assert.Equal(TerminalJapanese.Smart, new Settings().TerminalJapanese);
+        var path = Path.Combine(Path.GetTempPath(), $"meltype-terminal-{Guid.NewGuid():N}.json");
+        try
+        {
+            File.WriteAllText(path, $"{{ \"SettingsVersion\": {Settings.CurrentVersion} }}");
+            Assert.Equal(TerminalJapanese.Smart, Settings.Load(path).TerminalJapanese);
+            var settings = new Settings { TerminalJapanese = TerminalJapanese.CodeOnly };
+            settings.Save(path);
+            Assert.Equal(TerminalJapanese.CodeOnly, Settings.Load(path).TerminalJapanese, "保存した値を読み戻す");
+        }
+        finally { File.Delete(path); }
+    }
+
     [Test]
     public static void LineContext_MultiLineStringsAndComments()
     {

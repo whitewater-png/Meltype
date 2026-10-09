@@ -94,6 +94,17 @@ public enum PunctuationStyle
     [Description("、．")] ToutenFullWidthPeriod,
 }
 
+/// <summary>「コード」のアプリのターミナルで、どこの日本語を判定するか (#71)。</summary>
+public enum TerminalJapanese
+{
+    /// <summary>既定。コマンド名・オプション・パスは英字のまま、文を書く所 (引用符の中・echo の後・-m の後など) は日本語を判定する。</summary>
+    [Description("コマンドと文を見分ける")] Smart,
+    /// <summary>一般のアプリと同じに、どこでも日本語を判定する。</summary>
+    [Description("一般のアプリと同じ")] General,
+    /// <summary>引用符の中・# の後・AI の入力行だけ (1.0.1 までと同じ)。</summary>
+    [Description("引用符・コメントの中だけ")] CodeOnly,
+}
+
 public enum InputMode
 {
     /// <summary>Meltype 自身の変換ボックスで入力する (半角/全角 不要)。</summary>
@@ -564,6 +575,13 @@ public sealed class Settings
 
     [Category("7. アプリ"), DisplayName("アプリ別設定"), Description("プロセス名ごとに、自動切替の ON/OFF と種類を指定します。種類「コード」(コードエディター・ターミナル) では基本は英数のままで、コメント (// # -- など) と文字列 (\"…\" など) の中だけ日本語を判定します。コードの行で 半角/全角 を押すと、その行だけ日本語で入力できます。README.md などの文章ファイルを開いているときは一般として扱います。")]
     public List<AppRule> AppRules { get; set; } = DefaultAppRules();
+
+    [Category("7. アプリ"), DisplayName("ターミナルでの日本語"),
+     Description("種類「コード」のアプリのターミナル (Windows Terminal・PowerShell・コマンドプロンプト・VS Code のターミナルなど) で、どこの日本語を判定するか。" +
+                 "「コマンドと文を見分ける」: コマンド名・オプション (-x --foo)・パス・リダイレクト先は英字のまま通し (Tab の補完もそのまま効く)、引用符 (\"…\" '…') の中・# の後・echo や Write-Host の後・git commit -m や --message の後・AI の入力行 (> ) で日本語を判定します。画面の文字を読めないターミナルでは、一般のアプリと同じに判定します。" +
+                 "「一般のアプリと同じ」: どこでも日本語を判定します (変換ボックスが出ている間の Tab は候補の選択になります)。" +
+                 "「引用符・コメントの中だけ」: 前の版と同じです。どれでも 半角/全角 で日本語 / 英数を切り替えられます。")]
+    public TerminalJapanese TerminalJapanese { get; set; } = TerminalJapanese.Smart;
 
     [Category("7. アプリ"), DisplayName("独自の種類"), Description("アプリ別設定の「種類」に使える、自分で作る種類です。一般 / コード を元に、判定の強さ・ライブ変換・最初は英数にするか を変えられます (「全体と同じ」なら上の設定のまま)。")]
     public List<AppKind> AppKinds { get; set; } = [];

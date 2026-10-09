@@ -327,6 +327,8 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
     private long _lineVersion;
     private System.Threading.Timer? _lineTimer;
     private volatile bool _codeJapanese;
+    // 前面の入力欄のキャレットより前を UI Automation で読めなかった (読めないターミナルでは一般のアプリと同じに判定する)。
+    private volatile bool _lineUnreadable;
     private LineKind? _lastLineKind;
 
     /// <summary>
@@ -338,7 +340,9 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
         var app = _foreground.Current;
         if (settings.ProfileFor(app.ProcessName) != AppProfile.Code || LineContext.IsDocumentTitle(KeyText.WindowTitle(app.Window))) return CodeFocus.None;
         var focus = _composition?.Focus.Current;
-        return LineContext.ClassifyFocus(app.ProcessName, focus?.Name ?? "", focus?.ClassName ?? "");
+        var kind = LineContext.ClassifyFocus(app.ProcessName, focus?.Name ?? "", focus?.ClassName ?? "");
+        // ターミナルを一般のアプリと同じにする設定 (#71)。
+        return kind == CodeFocus.Terminal && settings.TerminalJapanese == TerminalJapanese.General ? CodeFocus.None : kind;
     }
 
     private bool IsCodeApp(Settings settings) => CurrentCodeFocus(settings) != CodeFocus.None;
@@ -349,14 +353,20 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
     /// </summary>
     private bool InCode(Settings settings)
     {
-        if (_codeJapanese || !IsCodeApp(settings)) return false;
+        if (_codeJapanese) return false;
+        var focus = CurrentCodeFocus(settings);
+        if (focus == CodeFocus.None) return false;
+        // ターミナル (#71): 設定が ON なら、コマンド名・オプション・パスは英字のまま、文を書く所 (echo の後・-m の後・引用符の中・AI の入力行) は日本語を判定する。
+        var shell = focus == CodeFocus.Terminal && settings.TerminalJapanese == TerminalJapanese.Smart;
         var line = _line.Text;
         if (line is null)
         {
             RequestLine(0);
-            return true;
+            // 画面の文字を読めないターミナルでは、行が分からないので一般のアプリと同じに判定する (いつも英字にはしない)。
+            return !(shell && _lineUnreadable);
         }
-        return LineContext.ClassifyText(line) == LineKind.Code;
+        // ターミナルの行は画面から読んだもの (プロンプトから始まる) に、打った文字を足したもの。
+        return shell ? LineContext.ClassifyShell(line, hasPrompt: _line.FromScreen) == LineKind.Code : LineContext.ClassifyText(line) == LineKind.Code;
     }
 
     /// <summary>アプリへ届いたキーで、今の行を追いかける。</summary>
@@ -419,6 +429,10 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
         var version = Interlocked.Read(ref _lineVersion);
         void Read() => composition.Focus.RequestTextBeforeCaret(before =>
         {
+            var unreadable = before is null;
+            if (unreadable != _lineUnreadable && CurrentCodeFocus(_settings) == CodeFocus.Terminal)
+                Log.Info(unreadable ? "ターミナル: 画面の文字を読めないので、一般のアプリと同じに判定します" : "ターミナル: 画面の文字を読めるので、コマンドと文を見分けます");
+            _lineUnreadable = unreadable;
             // 読んでいる間にキャレットが動いた・打鍵で分かったなら使わない。
             if (before is null || version != Interlocked.Read(ref _lineVersion) || _line.IsKnown) return;
             _line.SetFromText(before);
@@ -474,7 +488,11 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
         {
             var code = InCode(settings);
             var kind = code ? LineKind.Code : LineKind.Comment;
-            if (letter && _lastLineKind is { } last && last != kind) _composition?.ShowMode(!code);
+            if (letter && _lastLineKind is { } last && last != kind)
+            {
+                _composition?.ShowMode(!code);
+                if (CurrentCodeFocus(settings) == CodeFocus.Terminal) Log.Info(code ? "ターミナル: コマンドの所なので英字のまま通します" : "ターミナル: 文を書く所なので日本語を判定します");
+            }
             if (letter) _lastLineKind = kind;
             if (code) return false;
         }
@@ -716,6 +734,7 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
         // 変換中に別のウィンドウに切り替わったら、変換中の内容は捨てる (切り替わった先のアプリに入らないように)。
         _composition?.Abandon("別のウィンドウに切り替わった");
         _foreground.Refresh(window);
+        _lineUnreadable = false;
         InvalidateLine();
         _sigil.Start();
         _lastLineKind = null;
